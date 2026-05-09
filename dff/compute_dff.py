@@ -20,6 +20,13 @@ Pipeline:
     7. dF/F = (F_corr - F0_floored) / F0_floored
     8. Save outputs
 
+Design note on step 7:
+    The dF/F numerator uses unsmoothed F_corr rather than F_smoothed.
+    Smoothing is applied only to stabilize the F0 baseline estimate;
+    the signal itself is intentionally kept at full temporal resolution.
+    The floor is anchored to median(F_corr) — the unsmoothed signal —
+    so that the floor and the numerator share the same reference scale.
+
 """
 
 import argparse
@@ -33,7 +40,7 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter1d, percentile_filter
 
-PIPELINE_VERSION = "0.1.0"
+PIPELINE_VERSION = "0.1.1"
 
 # ============================================================================
 # Default parameters
@@ -46,6 +53,11 @@ DEFAULT_PARAMS = {
     "baseline_window_sec": 30.0,
     "f0_floor_epsilon": 0.1,
     "iscell_threshold": 0.3,
+    # Post-filter: drop ROIs where F0 is pinned to the floor for more than
+    # this fraction of the session. Such ROIs have dim or contaminated signal
+    # and produce extreme negative dF/F. Exposed as a parameter so it is
+    # logged to metadata and adjustable without touching source.
+    "post_filter_floor_frac": 0.05,
 }
 
 
@@ -81,11 +93,15 @@ def compute_dff(
     # Step 1: Neuropil correction
     F_corr = F - params["neuropil_coef"] * Fneu
 
-    # Step 2: Light pre-smoothing
+    # Step 2: Light pre-smoothing — used only to stabilize F0 estimation.
+    # The dF/F numerator uses unsmoothed F_corr (see module docstring).
     presmooth_sigma_frames = params["presmooth_sigma_sec"] * fs
     F_smoothed = gaussian_filter1d(F_corr, sigma=presmooth_sigma_frames, axis=1)
 
-    # Step 3: Rolling percentile baseline
+    # Step 3: Rolling percentile baseline.
+    # NOTE: percentile_filter is called in a Python loop over ROIs. This is
+    # intentional for clarity, but becomes a bottleneck at large cell counts
+    # (>500 ROIs). Consider a Numba or C extension if runtime is a concern.
     window_frames = int(params["baseline_window_sec"] * fs)
     F0 = np.array(
         [
@@ -96,13 +112,14 @@ def compute_dff(
         ]
     )
 
-    # Step 4: Per-ROI floor
+    # Step 4: Per-ROI floor anchored to median(F_corr) — unsmoothed — so the
+    # floor shares the same reference scale as the dF/F numerator.
     median_F_per_roi = np.median(F_corr, axis=1, keepdims=True)
     floor_per_roi = params["f0_floor_epsilon"] * median_F_per_roi
     floor_mask = F0 < floor_per_roi
     F0_floored = np.where(floor_mask, floor_per_roi, F0)
 
-    # Step 5: dF/F
+    # Step 5: dF/F — numerator uses unsmoothed F_corr (full temporal resolution).
     dff = (F_corr - F0_floored) / F0_floored
 
     return dff.astype(np.float32), F0_floored.astype(np.float32), floor_mask
@@ -251,10 +268,16 @@ def save_metadata(
     fs: float,
     n_timepoints: int,
     n_rois_total: int,
-    n_cells_kept: int,
+    n_cells_after_iscell: int,
+    n_cells_final: int,
     output_path: Path,
 ) -> None:
-    """Save run metadata as JSON."""
+    """Save run metadata as JSON.
+
+    Records both the post-iscell count and the final count after all
+    pre/post filters, so the two numbers can be cross-referenced against
+    dff.h5 without ambiguity.
+    """
     metadata = {
         "pipeline_version": PIPELINE_VERSION,
         "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -262,7 +285,10 @@ def save_metadata(
         "n_timepoints": int(n_timepoints),
         "session_length_sec": float(n_timepoints / fs),
         "n_rois_total": int(n_rois_total),
-        "n_cells_kept": int(n_cells_kept),
+        # n_cells_after_iscell: passed iscell threshold, before pre/post filters.
+        "n_cells_after_iscell": int(n_cells_after_iscell),
+        # n_cells_final: written to dff.h5 — after all filtering steps.
+        "n_cells_final": int(n_cells_final),
         "parameters": params,
     }
     with open(output_path, "w") as f:
@@ -294,6 +320,7 @@ def save_dff_h5(
         meta.attrs["presmooth_sigma_sec"] = params["presmooth_sigma_sec"]
         meta.attrs["f0_floor_epsilon"] = params["f0_floor_epsilon"]
         meta.attrs["iscell_threshold"] = params["iscell_threshold"]
+        meta.attrs["post_filter_floor_frac"] = params["post_filter_floor_frac"]
         meta.attrs["pipeline_version"] = PIPELINE_VERSION
         meta.attrs["timestamp_utc"] = (
             datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -323,13 +350,13 @@ def run(suite2p_dir: Path, output_dir: Path, params: dict) -> None:
 
     # Cell selection by iscell probability
     cell_mask = iscell[:, 1] > params["iscell_threshold"]
-    n_cells_kept = int(cell_mask.sum())
+    n_cells_after_iscell = int(cell_mask.sum())
     print(
         f"  Cells kept (iscell prob > {params['iscell_threshold']}): "
-        f"{n_cells_kept} / {n_rois_total}"
+        f"{n_cells_after_iscell} / {n_rois_total}"
     )
 
-    if n_cells_kept == 0:
+    if n_cells_after_iscell == 0:
         raise RuntimeError(
             f"No ROIs passed iscell threshold of {params['iscell_threshold']}. "
             "Check the iscell.npy file or lower the threshold."
@@ -376,18 +403,18 @@ def run(suite2p_dir: Path, output_dir: Path, params: dict) -> None:
     dff, F0, floor_mask = compute_dff(F_kept, Fneu_kept, fs, params)
 
     # Post-filter: drop cells with high floor-fraction. Cells where F0 is
-    # pinned to the floor for >5% of the session indicate that the rolling
-    # baseline can't track the trace cleanly — typically because of dim
-    # signal, transient artifacts, or contamination not caught by the
-    # pre-filter. Including them produces extreme negative dF/F outliers.
-    POST_FILTER_FLOOR_FRAC = 0.05
+    # pinned to the floor for > post_filter_floor_frac of the session indicate
+    # that the rolling baseline can't track the trace cleanly — typically
+    # because of dim signal, transient artifacts, or contamination not caught
+    # by the pre-filter. Including them produces extreme negative dF/F outliers.
+    post_filter_floor_frac = params["post_filter_floor_frac"]
     floor_frac_per_cell = floor_mask.mean(axis=1)
-    post_filter_mask = floor_frac_per_cell <= POST_FILTER_FLOOR_FRAC
+    post_filter_mask = floor_frac_per_cell <= post_filter_floor_frac
     n_post_dropped = int((~post_filter_mask).sum())
     if n_post_dropped > 0:
         print(
             f"  [Post-filter] Dropping {n_post_dropped} ROIs with "
-            f">{POST_FILTER_FLOOR_FRAC:.0%} of timepoints at F0 floor"
+            f">{post_filter_floor_frac:.0%} of timepoints at F0 floor"
         )
         F_kept = F_kept[post_filter_mask]
         Fneu_kept = Fneu_kept[post_filter_mask]
@@ -444,6 +471,7 @@ def run(suite2p_dir: Path, output_dir: Path, params: dict) -> None:
         fs,
         F.shape[1],
         n_rois_total,
+        n_cells_after_iscell,
         n_cells_final,
         output_dir / "dff_metadata.json",
     )
@@ -490,6 +518,15 @@ def main():
     parser.add_argument(
         "--iscell_threshold", type=float, default=DEFAULT_PARAMS["iscell_threshold"]
     )
+    parser.add_argument(
+        "--post_filter_floor_frac",
+        type=float,
+        default=DEFAULT_PARAMS["post_filter_floor_frac"],
+        help=(
+            "Drop ROIs where F0 is at the floor for more than this fraction "
+            "of the session (default: %(default)s)."
+        ),
+    )
     args = parser.parse_args()
 
     params = {
@@ -499,6 +536,7 @@ def main():
         "baseline_window_sec": args.baseline_window_sec,
         "f0_floor_epsilon": args.f0_floor_epsilon,
         "iscell_threshold": args.iscell_threshold,
+        "post_filter_floor_frac": args.post_filter_floor_frac,
     }
 
     run(args.suite2p_dir, args.output_dir, params)
