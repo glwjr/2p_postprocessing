@@ -13,7 +13,7 @@ Usage:
 Pipeline:
     1. Load F.npy, Fneu.npy, iscell.npy, ops.npy
     2. Filter ROIs by iscell probability threshold
-    3. Neuropil-correct: F_corr = F - 0.7 * Fneu
+    3. Neuropil-correct: F_corr = F - 0.5 * Fneu  (default; override via --neuropil_coef)
     4. Light Gaussian pre-smoothing (1s sigma)
     5. Rolling 8th percentile baseline (30s window)
     6. Floor F0 at 0.1 * median(F_corr) per ROI
@@ -109,7 +109,9 @@ def compute_dff(
     # NOTE: percentile_filter is called in a Python loop over ROIs. This is
     # intentional for clarity, but becomes a bottleneck at large cell counts
     # (>500 ROIs). Consider a Numba or C extension if runtime is a concern.
-    window_frames = int(params["baseline_window_sec"] * fs)
+    window_frames = (
+        int(params["baseline_window_sec"] * fs) | 1
+    )  # ensure odd for symmetric centering
     F0 = np.array(
         [
             percentile_filter(
