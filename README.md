@@ -25,7 +25,7 @@ This repo provides standardized post-processing steps that run after Suite2p (ce
 Raw 2P imaging data
         │
         ▼
-   Suite2p  (najafi-laboratory/2p_imaging)
+   Suite2p  (2p_imaging)
         │  F.npy, Fneu.npy, iscell.npy, ops.npy per session
         │
         ├───────────────────────────────────────┐
