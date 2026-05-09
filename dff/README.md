@@ -1,9 +1,5 @@
 # Standardized dF/F Computation
 
-**Status:** Draft for review (Najafi Lab)
-
-**Author:** Gary White
-
 This module computes dF/F from Suite2p outputs as a standardized post-processing step in the lab pipeline. It produces an HDF5 file with the dF/F traces, a diagnostic figure, a per-cell summary CSV, and a metadata JSON.
 
 ## Why this exists
@@ -30,7 +26,7 @@ Filter ROIs in three layered passes:
 
 2. **F_corrected pre-filter.** After computing `F - 0.7 * Fneu` for each remaining ROI, drop ROIs where the 5th percentile of `F_corrected` is non-positive. These ROIs have neuropil contamination exceeding the cell signal during parts of the session — even if the median is positive, substantial negative dips produce extreme dF/F outliers regardless of the F0 floor. Using the 5th percentile (rather than the median) catches cells that are mostly positive but dip negative for some fraction of the session.
 
-3. **F0 floor-fraction post-filter.** After computing F0 and dF/F, drop ROIs where F0 is pinned to the floor for more than 5% of the session. Cells that hit the floor frequently indicate that the rolling baseline can't track the trace cleanly — typically because of dim signal, transient artifacts, or contamination not caught by the pre-filter. Including them produces extreme negative dF/F outliers in their tails.
+3. **F0 floor-fraction post-filter.** After computing F0 and dF/F, drop ROIs where F0 is pinned to the floor for more than 5% of the session (default; configurable via `--post_filter_floor_frac`). Cells that hit the floor frequently indicate that the rolling baseline can't track the trace cleanly — typically because of dim signal, transient artifacts, or contamination not caught by the pre-filter. Including them produces extreme negative dF/F outliers in their tails.
 
 The iscell threshold is the most defensible deterministic rule for the first pass given the current state of the pipeline. The Suite2p classifier was disabled in the existing config, so the binary first column reflects whatever ad-hoc curation produced it (often only a handful of cells). The probability column is populated by Suite2p's anatomical sparse detection regardless of the classifier setting, and a threshold of 0.3 produces cell counts in a range typical for cortical 2P imaging (e.g. 70 cells for the 20250828 session, vs. 42 from the binary column). The two F_corrected filters typically drop a small additional number (e.g. 2–6 cells per session combined) and are necessary to prevent extreme dF/F outliers in the final output.
 
@@ -149,7 +145,7 @@ python compute_dff.py \
     --baseline_window_sec 60
 ```
 
-Available flags: `--neuropil_coef`, `--presmooth_sigma_sec`, `--baseline_percentile`, `--baseline_window_sec`, `--f0_floor_epsilon`, `--iscell_threshold`.
+Available flags: `--neuropil_coef`, `--presmooth_sigma_sec`, `--baseline_percentile`, `--baseline_window_sec`, `--f0_floor_epsilon`, `--iscell_threshold`, `--post_filter_floor_frac`.
 
 ## Running on a batch of sessions
 
@@ -191,6 +187,26 @@ Before applying to all batch 1 sessions, validate on session 20250828 by:
 5. Optionally running a parameter sensitivity check: vary `f0_floor_epsilon` (0.05, 0.1, 0.2), `baseline_percentile` (5, 8, 10), and `baseline_window_sec` (20, 30, 60). Output should be robust to these choices.
 
 If anything looks off, parameter tuning or a different cell-selection rule may be needed before applying to all 10 batch 1 sessions.
+
+## Testing
+
+The pipeline has an automated test suite covering both the core `compute_dff()` function and the full end-to-end `run()` pipeline. Tests use synthetic Suite2p outputs built by pytest fixtures, so no real session data is required to run them.
+
+```bash
+# Full suite (~30 seconds)
+pytest
+
+# Unit tests only — fast enough for a pre-commit hook
+pytest test_compute_dff.py
+```
+
+Test files:
+
+- `test_compute_dff.py` — unit tests on `compute_dff()` with deterministic synthetic inputs. Covers neuropil correction math, baseline tracking on slow drift, transient recovery, F0 floor activation, output shapes/dtypes, per-ROI independence, and determinism.
+- `test_pipeline.py` — integration tests on `run()` against synthetic Suite2p directories. Covers output file production, cross-file consistency (e.g. `dff.h5` shape matches `n_cells_final` in metadata), parameter propagation, filter behavior, signal recovery on transient-bearing data, and pipeline determinism.
+- `conftest.py` — shared pytest fixtures, including a clean 20-ROI synthetic session and a 10-ROI session with injected calcium transients.
+
+The tests verify pipeline correctness on synthetic data; they don't replace the manual validation step above on real sessions. Both layers are needed.
 
 ## Open questions
 
