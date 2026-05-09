@@ -1,7 +1,4 @@
 """
-compute_dff.py
-==============
-
 Standardized dF/F computation for Najafi Lab 2P imaging pipeline.
 
 Takes Suite2p outputs from a single session and produces:
@@ -23,7 +20,6 @@ Pipeline:
     7. dF/F = (F_corr - F0_floored) / F0_floored
     8. Save outputs
 
-See dff_method.md for full rationale.
 """
 
 import argparse
@@ -40,7 +36,7 @@ from scipy.ndimage import gaussian_filter1d, percentile_filter
 PIPELINE_VERSION = "0.1.0"
 
 # ============================================================================
-# Default parameters (see dff_method.md for rationale)
+# Default parameters
 # ============================================================================
 
 DEFAULT_PARAMS = {
