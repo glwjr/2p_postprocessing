@@ -31,7 +31,7 @@ Design note on step 7:
 
 import argparse
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import h5py
@@ -102,6 +102,12 @@ def compute_dff(
     # NOTE: percentile_filter is called in a Python loop over ROIs. This is
     # intentional for clarity, but becomes a bottleneck at large cell counts
     # (>500 ROIs). Consider a Numba or C extension if runtime is a concern.
+    #
+    # Boundary behaviour: percentile_filter uses mode='reflect' (default). The
+    # first and last window_frames//2 frames of F0 are therefore estimated from
+    # reflected signal. At 30 Hz with a 30 s window this is the first/last 450
+    # frames (~15 s). Treat F0 (and dF/F) in those edge windows cautiously,
+    # especially for sessions with large signals at the start or end.
     window_frames = int(params["baseline_window_sec"] * fs)
     F0 = np.array(
         [
@@ -115,6 +121,19 @@ def compute_dff(
     # Step 4: Per-ROI floor anchored to median(F_corr) — unsmoothed — so the
     # floor shares the same reference scale as the dF/F numerator.
     median_F_per_roi = np.median(F_corr, axis=1, keepdims=True)
+
+    # Guard: floor logic requires a positive median. A zero or negative median
+    # means neuropil over-subtracted the signal. The pre-filter in run() drops
+    # such ROIs before calling compute_dff(); hitting this path indicates the
+    # caller skipped that filter.
+    if (median_F_per_roi <= 0).any():
+        bad = int((median_F_per_roi <= 0).sum())
+        raise ValueError(
+            f"{bad} ROI(s) have median(F_corr) ≤ 0. Neuropil correction "
+            "over-subtracted the signal. Apply the pre-filter (5th-percentile "
+            "F_corr > 0) before calling compute_dff(), or lower neuropil_coef."
+        )
+
     floor_per_roi = params["f0_floor_epsilon"] * median_F_per_roi
     floor_mask = F0 < floor_per_roi
     F0_floored = np.where(floor_mask, floor_per_roi, F0)
@@ -246,13 +265,21 @@ def make_cell_summary(
     iscell_prob: np.ndarray,
     output_path: Path,
 ) -> None:
-    """Save per-cell summary statistics as CSV."""
+    """Save per-cell summary statistics as CSV.
+
+    Column notes:
+        median_F_raw  — median of the RAW fluorescence (no neuropil correction).
+                        Reflects photon count level; do NOT compare directly to
+                        median_F0, which is neuropil-corrected and baseline-estimated.
+        median_F0     — median of the floored baseline (neuropil-corrected, Gaussian-
+                        smoothed, rolling-percentile, then floor-clamped).
+    """
     df = pd.DataFrame(
         {
             "row_index": np.arange(dff.shape[0]),
             "suite2p_roi_index": cell_indices,
             "iscell_prob": iscell_prob,
-            "median_F": np.median(F, axis=1),
+            "median_F_raw": np.median(np.asarray(F, dtype=np.float32), axis=1),
             "median_F0": np.median(F0, axis=1),
             "dff_max": dff.max(axis=1),
             "dff_min": dff.min(axis=1),
@@ -280,7 +307,9 @@ def save_metadata(
     """
     metadata = {
         "pipeline_version": PIPELINE_VERSION,
-        "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp_utc": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
         "fs": float(fs),
         "n_timepoints": int(n_timepoints),
         "session_length_sec": float(n_timepoints / fs),
@@ -323,7 +352,9 @@ def save_dff_h5(
         meta.attrs["post_filter_floor_frac"] = params["post_filter_floor_frac"]
         meta.attrs["pipeline_version"] = PIPELINE_VERSION
         meta.attrs["timestamp_utc"] = (
-            datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
         )
 
 
