@@ -13,22 +13,44 @@ This repo provides standardized post-processing steps that run after Suite2p (ce
 | [`dff/`](dff/) | Draft   | Standardized dF/F computation from Suite2p F/Fneu traces                                     |
 | `similarity/`  | Planned | Cross-session pairwise similarity analysis on dF/F traces (consumes ROICaT UCID assignments) |
 
+## Notebooks
+
+| Notebook                                                                 | Description                                                            |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| [`notebooks/tracking_notebook.ipynb`](notebooks/tracking_notebook.ipynb) | Interactive ROICaT tracking pipeline for matching ROIs across sessions |
+
 ## Pipeline context
 
 ```
 Raw 2P imaging data
         │
         ▼
-   Suite2p (existing: najafi-laboratory/2p_imaging)
-        │  produces F.npy, Fneu.npy, iscell.npy, ops.npy per session
-        ▼
-   ROICaT (existing: najafi-laboratory/cell_matching_roicat)
-        │  produces UCID assignments matching ROIs across sessions
-        ▼
-   This repo
-        │  produces standardized dF/F + cross-session similarity analyses
-        ▼
-   Downstream science (plasticity, drift, etc.)
+   Suite2p  (najafi-laboratory/2p_imaging)
+        │  F.npy, Fneu.npy, iscell.npy, ops.npy per session
+        │
+        ├───────────────────────────────────────┐
+        ▼                                       ▼
+   dff/compute_dff.py                  notebooks/tracking_notebook.ipynb
+   ─────────────────                  ──────────────────────────────────
+   neuropil correction                geometric + non-rigid FOV alignment
+   rolling-percentile F₀              ROInet + SWT feature embedding
+   dF/F with diagnostics              HDBSCAN / Hungarian clustering
+        │                                       │
+        │  dff.h5                               │  UCID assignments
+        │  dff_cell_summary.csv                 │  (cross-session ROI labels)
+        │  dff_metadata.json                    │
+        │  dff_diagnostics.png                  │
+        │                                       │
+        └───────────────┬───────────────────────┘
+                        ▼
+             similarity/  (planned)
+             ────────────────────────────────────
+             cross-session pairwise similarity
+             on dF/F traces, keyed by UCID
+                        │
+                        ▼
+             Downstream science
+             (plasticity, representational drift, …)
 ```
 
 ## Setup
