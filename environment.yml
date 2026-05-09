@@ -12,6 +12,9 @@ dependencies:
   - matplotlib>=3.7
   - pandas>=2.0
 
+  # Dev dependencies
+  - pytest>=7.0
+
   # pip is required to install ROICaT (not available via conda-forge)
   - pip
   - pip:
