@@ -24,7 +24,7 @@ Filter ROIs in three layered passes:
 
 1. **iscell threshold.** Keep ROIs where `iscell[:, 1] > 0.3` (the second column is Suite2p's anatomical detection probability).
 
-2. **F_corrected pre-filter.** After computing `F - 0.7 * Fneu` for each remaining ROI, drop ROIs where the 5th percentile of `F_corrected` is non-positive. These ROIs have neuropil contamination exceeding the cell signal during parts of the session — even if the median is positive, substantial negative dips produce extreme dF/F outliers regardless of the F0 floor. Using the 5th percentile (rather than the median) catches cells that are mostly positive but dip negative for some fraction of the session.
+2. **F_corrected pre-filter.** After computing `F - neuropil_coef * Fneu` for each remaining ROI, drop ROIs where the 5th percentile of `F_corrected` is non-positive. These ROIs have neuropil contamination exceeding the cell signal during parts of the session — even if the median is positive, substantial negative dips produce extreme dF/F outliers regardless of the F0 floor. Using the 5th percentile (rather than the median) catches cells that are mostly positive but dip negative for some fraction of the session.
 
 3. **F0 floor-fraction post-filter.** After computing F0 and dF/F, drop ROIs where F0 is pinned to the floor for more than 5% of the session (default; configurable via `--post_filter_floor_frac`). Cells that hit the floor frequently indicate that the rolling baseline can't track the trace cleanly — typically because of dim signal, transient artifacts, or contamination not caught by the pre-filter. Including them produces extreme negative dF/F outliers in their tails.
 
@@ -35,10 +35,14 @@ The iscell threshold is the most defensible deterministic rule for the first pas
 ### Step 2: Neuropil correction
 
 ```
-F_corrected(t) = F(t) - 0.7 * F_neu(t)
+F_corrected(t) = F(t) - 0.5 * F_neu(t)
 ```
 
-The 0.7 coefficient is the Suite2p / Pachitariu lab convention and matches the existing config (`neucoeff: 0.7`). Unchanged.
+The 0.5 coefficient is a deliberate deviation from the Suite2p / Pachitariu lab convention of 0.7. The default was chosen empirically based on a sweep across five sessions from two SA-line mice (SA11_LG: 20250825, 20250827, 20250828; SA17_LG: 20251226, 20251227). At the Suite2p convention of 0.7, the F_corrected pre-filter (Step 1) was dropping 21–27% of iscell-passing ROIs as neuropil-dominated — a clear signal that the standard coefficient was over-subtracting on this lab's V1 GCaMP imaging. At 0.5, the pre-filter drops only 5–7% of cells across all five sessions, with no other adverse effects: zero F0 floor activations, stable median dF/F (0.066–0.085), stable 99th percentile (1.15–1.45), and 92–95% cell yield of iscell-passing ROIs.
+
+This is a defensible deviation, not a casual one. The pre-filter drop count is a clean signal of over-subtraction (it counts ROIs where the corrected signal goes substantially negative), and the 4× reduction at 0.5 is consistent across both mice. The trade-off is comparability with other Suite2p users who use the convention; that cost is documented in the metadata JSON and HDF5 attrs of every output, so anyone consuming this lab's dF/F can see the value used.
+
+The decision should be revisited if data from a non-SA-line mouse, a different indicator, or substantially different imaging conditions becomes available — there's no guarantee 0.5 is the right value outside the regime it was tuned on. For data outside this regime, override at the command line via `--neuropil_coef`.
 
 ### Step 3: Light pre-smoothing
 
@@ -71,7 +75,7 @@ dff(t) = (F_corrected(t) - F0_floored(t)) / F0_floored(t)
 |                      | Current                                   | Proposed                                                                          |
 | -------------------- | ----------------------------------------- | --------------------------------------------------------------------------------- |
 | dF/F step location   | Undocumented post-processing              | Standardized script (`compute_dff.py`)                                            |
-| Neuropil coefficient | 0.7                                       | 0.7 (unchanged)                                                                   |
+| Neuropil coefficient | 0.7                                       | 0.5 (tuned for SA-line data; see Step 2)                                          |
 | Baseline method      | `maximin` (config) or unknown (actual)    | Rolling 8th percentile, 30s window                                                |
 | Pre-smoothing        | 10s Gaussian (config) or unknown (actual) | 1s Gaussian                                                                       |
 | F₀ floor             | None (causes blowups)                     | Per-ROI, 0.1 × median(F_corrected)                                                |
@@ -204,9 +208,48 @@ Test files:
 
 - `test_compute_dff.py` — unit tests on `compute_dff()` with deterministic synthetic inputs. Covers neuropil correction math, baseline tracking on slow drift, transient recovery, F0 floor activation, output shapes/dtypes, per-ROI independence, and determinism.
 - `test_pipeline.py` — integration tests on `run()` against synthetic Suite2p directories. Covers output file production, cross-file consistency (e.g. `dff.h5` shape matches `n_cells_final` in metadata), parameter propagation, filter behavior, signal recovery on transient-bearing data, and pipeline determinism.
+- `test_regression_allen.py` — regression test against a small slice of real Allen Brain Observatory data committed under `tests/fixtures/allen_slice/`. Re-running the pipeline against the fixture must produce byte-identical dF/F, F0, and cell indices to what was saved when the fixture was built. Skipped automatically if the fixture isn't present (fresh clone).
 - `conftest.py` — shared pytest fixtures, including a clean 20-ROI synthetic session and a 10-ROI session with injected calcium transients.
 
+To generate or update the regression fixture, run `python build_regression_fixture.py` once locally with AllenSDK installed. This pulls one Allen experiment, slices it to 30 cells × 5 minutes, runs `compute_dff.py` on the slice, and writes the inputs and expected output to `tests/fixtures/allen_slice/`. Commit the fixture and the regression test runs against it on every subsequent test invocation. Re-run the helper only when the pipeline's expected output legitimately changes (intentional algorithm changes, version bumps).
+
 The tests verify pipeline correctness on synthetic data; they don't replace the manual validation step above on real sessions. Both layers are needed.
+
+## Cross-pipeline validation against Allen Brain Observatory
+
+Beyond manual inspection on lab sessions and automated tests on synthetic data, this module includes scripts to validate `compute_dff.py` against the Allen Brain Observatory Visual Coding 2P dataset. Allen publishes raw fluorescence (`F`), neuropil traces (`Fneu`), and their own pipeline's dF/F traces, all derived from awake mouse visual cortex 2P imaging — the same domain the lab works in. Comparing our dF/F against Allen's published dF/F is a strong sanity check that the pipeline produces reasonable output by industry standards before applying it to real Najafi Lab data.
+
+The validation reads Allen's NWB files directly via `h5py` (already in `environment.yml`), avoiding the AllenSDK dependency, which has Python 3.12 compatibility issues.
+
+```bash
+# Pull one Allen experiment, write Suite2p-format outputs + Allen's reference dF/F
+python adapt_allen_to_suite2p.py --output_dir ~/allen_validation
+
+# Run our pipeline on it
+python compute_dff.py \
+    --suite2p_dir ~/allen_validation/suite2p/plane0 \
+    --output_dir ~/allen_validation/dff_output
+
+# Compare our dF/F against Allen's published dF/F
+python compare_to_allen.py \
+    --our_dff ~/allen_validation/dff_output/dff.h5 \
+    --allen_dff ~/allen_validation/allen_dff.npy \
+    --output_fig ~/allen_validation/comparison.png
+```
+
+Allen's pipeline differs from ours in two ways that matter for interpretation:
+
+1. **Neuropil correction.** Allen estimates a per-cell `r` value via their demixing model rather than using a fixed 0.7 coefficient. So expect numerical differences in absolute dF/F values.
+2. **Baseline estimation.** Allen uses a different baseline method (documented in their technical whitepaper). Bulk distributional shape should still match closely, but exact percentiles will differ.
+
+What to look for in the comparison output:
+
+- **Per-cell max-dF/F correlation > 0.7** (Pearson r). The two pipelines should rank cells by activity similarly. Below ~0.5 is a signal worth investigating.
+- **Median dF/F near zero in both.** Sparse activity should leave the bulk of the distribution at baseline regardless of pipeline.
+- **99th percentile within ~30%.** Exact match isn't expected because of the differences above, but a 2× or 0.5× discrepancy points to parameter issues.
+- **Q-Q plot roughly along y = x for the body of the distribution.** Divergence in the top 1% is fine; the bulk should track.
+
+Important limitation: this validates that the pipeline produces reasonable output by industry standards. It does **not** validate that the parameters are right for Najafi Lab data specifically — different mice, indicators, and imaging conditions may require different choices. Manual inspection of `dff_diagnostics.png` on a real session (the Validation section above) remains essential.
 
 ## Open questions
 
@@ -217,3 +260,5 @@ The tests verify pipeline correctness on synthetic data; they don't replace the 
 3. **Long-term cell selection.** The 0.3 probability threshold is a stopgap. A trained Suite2p classifier on 5–10 manually-curated sessions would produce more reliable selection across the lab's data. Worth scoping as a separate task.
 
 4. **Backwards compatibility.** Existing analyses using the old `dff.h5` format will need to be updated to read the new format. The `cell_indices` field is the main addition that enables better downstream use.
+
+5. **Neuropil coefficient generalization.** The 0.5 default is tuned on SA-line mice. Whether it holds on other cre lines, indicators, or imaging conditions is an empirical question. Re-run the pre-filter drop-count sweep (0.5 vs 0.7) on the first session of each new mouse line to confirm 0.5 is still the right value before committing batch processing. Pre-drops in the 5–10% range with no floor activations is the pass criterion.

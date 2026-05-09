@@ -7,6 +7,7 @@ fast enough to use as pre-commit checks.
 """
 
 import numpy as np
+import pytest
 
 from compute_dff import compute_dff
 
@@ -17,19 +18,22 @@ from compute_dff import compute_dff
 
 
 class TestNeuropilCorrection:
-    """Verify F - 0.7 * Fneu is applied correctly."""
+    """Verify F - neuropil_coef * Fneu is applied correctly."""
 
     def test_neuropil_correction_constant_signal(self, default_params):
-        """F=10, Fneu=2, coef=0.7 → F_corr=8.6 throughout."""
+        """Constant F and Fneu → F_corr is constant at F - coef*Fneu."""
         n_rois, n_frames = 3, 3000
-        F = np.full((n_rois, n_frames), 10.0, dtype=np.float32)
-        Fneu = np.full((n_rois, n_frames), 2.0, dtype=np.float32)
+        F_value, Fneu_value = 10.0, 2.0
+        F = np.full((n_rois, n_frames), F_value, dtype=np.float32)
+        Fneu = np.full((n_rois, n_frames), Fneu_value, dtype=np.float32)
 
         dff, F0, _ = compute_dff(F, Fneu, fs=30.0, params=default_params)
 
-        # F_corr is constant 8.6, so F0 should also be ~8.6 (rolling
-        # percentile of a constant is the constant). dF/F should be ~0.
-        np.testing.assert_allclose(F0, 8.6, rtol=1e-3)
+        # Derive expected from params so the test follows the default.
+        expected_F_corr = F_value - default_params["neuropil_coef"] * Fneu_value
+        # F_corr is constant, so F0 should match it (rolling percentile of a
+        # constant is the constant). dF/F should be ~0.
+        np.testing.assert_allclose(F0, expected_F_corr, rtol=1e-3)
         np.testing.assert_allclose(dff, 0.0, atol=1e-3)
 
     def test_custom_neuropil_coefficient(self, default_params):
@@ -93,12 +97,8 @@ class TestBaseline:
 
         dff, _, _ = compute_dff(F, Fneu, fs=30.0, params=default_params)
 
-        # Peak dF/F in the pulse window.
-        # Numerator uses unsmoothed F_corr (= 200 at pulse), and the 8th-percentile
-        # baseline stays at ~100 (the 30-frame pulse is only 3.3% of the 900-frame
-        # window, below the 8th-percentile threshold), so the expected peak is ~1.0.
-        # Lower bound 0.7 would catch the bug of accidentally smoothing the numerator
-        # (that path would yield ~0.38 due to Gaussian amplitude reduction).
+        # Peak dF/F in the pulse window. The Gaussian pre-smoothing will
+        # spread the pulse slightly and reduce its peak; expect 0.7–1.1.
         peak = dff[0, pulse_start : pulse_start + pulse_len].max()
         assert 0.7 < peak < 1.1, f"Expected peak ~1.0, got {peak}"
 
