@@ -24,19 +24,6 @@ calcium transients are injected into F_C; F_N has slow drift plus noise.
 The fitter runs on each cell, and we compare estimated vs true r.
 """
 
-# ============================================================================
-# IMPORT YOUR FITTER HERE
-# ============================================================================
-# The fitter should take (F_M, F_N, fs) and return at minimum the estimated
-# r value for one cell. If your function has a different signature, wrap it
-# with a small adapter — see fit_one_cell() below.
-#
-# Example imports to try, in rough order of likely names:
-#   from compute_dff import fit_neuropil_r
-#   from compute_dff import estimate_r
-#   from compute_dff import fit_r_one_cell
-# ============================================================================
-
 import sys
 from pathlib import Path
 
