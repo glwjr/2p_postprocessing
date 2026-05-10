@@ -69,3 +69,9 @@ This creates an environment with the scientific Python stack (numpy, scipy, h5py
 - Each module is a self-contained subdirectory with its own `README.md`.
 - Default parameters are set at the top of each script and overridable via command line.
 - Output files always include a metadata JSON or HDF5 attribute group recording the parameters used and the pipeline version.
+
+## Attribution
+
+- The notebook [notebooks/tracking_notebook.ipynb](notebooks/tracking_notebook.ipynb) is adapted from the ROICaT project (RichieHakim/ROICaT) by Rich Hakim. ROICaT is licensed under the GNU General Public License v3.0 (GPL-3.0). Because content from ROICaT is included here, redistribution or publication of this notebook (or a larger work that includes it) must comply with GPL-3.0: preserve copyright and license notices, make source available, and apply the same license to derivative works. See https://www.gnu.org/licenses/gpl-3.0.en.html for details.
+
+If you plan to redistribute or publish this repository or derivative works, ensure you understand and follow the GPL-3.0 obligations, or contact the original author for alternate licensing if needed.
