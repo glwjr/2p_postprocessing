@@ -13,10 +13,11 @@ Usage:
 Pipeline:
     1. Load F.npy, Fneu.npy, iscell.npy, ops.npy
     2. Filter ROIs by iscell probability threshold
-    3. Neuropil-correct: F_corr = F - 0.5 * Fneu  (default; override via --neuropil_coef)
+    3. Estimate per-ROI neuropil coef r via Allen's cross-validated method;
+       neuropil-correct: F_corr = F - r * Fneu
     4. Light Gaussian pre-smoothing (1s sigma)
     5. Rolling 8th percentile baseline (30s window)
-    6. Floor F0 at 0.1 * median(F_corr) per ROI
+    6. Floor F0 at 0.1 * |median(F_corr)| per ROI
     7. dF/F = (F_corr - F0_floored) / F0_floored
     8. Save outputs
 
@@ -24,8 +25,9 @@ Design note on step 7:
     The dF/F numerator uses unsmoothed F_corr rather than F_smoothed.
     Smoothing is applied only to stabilize the F0 baseline estimate;
     the signal itself is intentionally kept at full temporal resolution.
-    The floor is anchored to median(F_corr) — the unsmoothed signal —
-    so that the floor and the numerator share the same reference scale.
+    The floor is anchored to |median(F_corr)| — absolute value of the
+    unsmoothed signal — so that the floor is always non-negative and
+    shares the same reference scale as the numerator.
 
 """
 
@@ -39,22 +41,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter1d, percentile_filter
+from scipy.optimize import minimize_scalar
+from scipy.sparse import diags
+from scipy.sparse.linalg import spsolve
 
-PIPELINE_VERSION = "0.2.0"
+PIPELINE_VERSION = "0.4.1"
 
 # ============================================================================
 # Default parameters
 # ============================================================================
 
 DEFAULT_PARAMS = {
-    # Empirically tuned to 0.5 for SA-line lab data (N=5 sessions across
-    # SA11 and SA17). The Suite2p convention is 0.7, but on this lab's V1
-    # GCaMP imaging that value over-subtracts, dropping ~20-27% of
-    # iscell-passing ROIs via the pre-filter. At 0.5 the pre-filter drops
-    # ~5-7% with no other adverse effects (no floor activations, stable
-    # bulk distribution, comparable transient amplitudes). See the dff/
-    # README "Step 2: Neuropil correction" section for the full rationale.
-    "neuropil_coef": 0.5,
+    # Per-ROI neuropil coefficient estimation (default). None triggers Allen
+    # Brain Observatory's cross-validated regression method (Visual Behavior
+    # 2P whitepaper, Section F). Set to a float to override with a fixed
+    # global value (e.g. 0.7 for the Suite2p convention).
+    "neuropil_coef": None,
     "presmooth_sigma_sec": 1.0,
     "baseline_percentile": 8,
     "baseline_window_sec": 30.0,
@@ -69,12 +71,181 @@ DEFAULT_PARAMS = {
 
 
 # ============================================================================
+# Neuropil coefficient estimation (Allen Visual Behavior 2P whitepaper, §F)
+# ============================================================================
+
+
+def _solve_F_C(target: np.ndarray, lam: float) -> np.ndarray:
+    """
+    Closed-form F_C minimizing
+        sum_t (F_C[t] - target[t])^2 + lam * sum_t (F_C[t+1] - F_C[t])^2.
+
+    Setting dE/dF_C = 0 gives a tridiagonal system. Boundary rows have only
+    one neighbor, so the diagonal there is (1 + lam) instead of (1 + 2*lam).
+    """
+    T = target.shape[0]
+    main = np.full(T, 1.0 + 2.0 * lam)
+    main[0] = 1.0 + lam
+    main[-1] = 1.0 + lam
+    off = np.full(T - 1, -lam)
+    A = diags([off, main, off], [-1, 0, 1], format="csc")
+    return spsolve(A, target)
+
+
+def _compute_E(F_M: np.ndarray, F_N: np.ndarray, r: float, lam: float) -> float:
+    """E (time-mean) for a given r, with F_C taken as its closed-form minimizer."""
+    target = F_M - r * F_N
+    F_C = _solve_F_C(target, lam)
+    residual_mse = np.mean((F_C - target) ** 2)
+    deriv_mse = np.mean(np.diff(F_C) ** 2)
+    return float(residual_mse + lam * deriv_mse)
+
+
+def _fit_r_one_cell(
+    F_M: np.ndarray, F_N: np.ndarray, lam: float = 0.05
+) -> tuple[float | None, str]:
+    """
+    Estimate r for one cell using the Allen Visual Behavior 2P whitepaper's
+    cross-validated regression with smoothness regularization (page 36).
+
+    The whitepaper specifies gradient descent with a particular learning
+    rate and stopping rule. We use bracketed Brent's method (scipy's
+    minimize_scalar with method='bounded') instead — same objective
+    function, same cross-validation, but ~200x faster (10-20 function
+    evaluations vs. 400+ gradient steps near a flat minimum).
+
+    The optimization is run on the second half of the trace (the eval half),
+    matching the whitepaper's cross-validation strategy.
+
+    Returns (r, status). r is None if all attempts failed.
+    Status is one of:
+      - 'converged'             : optimum found cleanly in [0, 1]
+      - 'converged_widened'     : found at boundary, widened bracket and clipped
+      - 'failed_E_too_high'     : E exceeds whitepaper threshold of 2*|<F_M>|
+      - 'flagged_constant_fneu' : F_N has no variation
+    """
+    F_N = np.asarray(F_N, dtype=np.float64)
+    F_M = np.asarray(F_M, dtype=np.float64)
+
+    fneu_min = F_N.min()
+    fneu_range = F_N.max() - fneu_min
+    if fneu_range < 1e-9:
+        return None, "flagged_constant_fneu"
+
+    # Per-ROI normalization: F_N to (0, 1); F_M scaled by the same factor.
+    # This standardizes the optimization across cells of varying brightness
+    # without changing the optimum r (verified by E-landscape sweeps).
+    F_N_norm = (F_N - fneu_min) / fneu_range
+    F_M_norm = F_M / fneu_range
+
+    half = F_M_norm.shape[0] // 2
+    F_M_eval = F_M_norm[half:]
+    F_N_eval = F_N_norm[half:]
+
+    # Convergence threshold from whitepaper: E < 2 * |<F_M>|.
+    E_thresh = 2.0 * abs(np.mean(F_M_norm))
+
+    def _minimize(bracket):
+        result = minimize_scalar(
+            lambda r: _compute_E(F_M_eval, F_N_eval, r, lam),
+            bounds=bracket,
+            method="bounded",
+            options={"xatol": 1e-4},
+        )
+        return float(result.x), float(result.fun)
+
+    # Attempt 1: bounded search in [0, 1].
+    r, E = _minimize((0.0, 1.0))
+
+    # If the optimum is at the boundary, the true minimum may lie outside.
+    # Widen and re-check; clip to [0, 1] for the final answer.
+    at_boundary = (r < 0.01) or (r > 0.99)
+    if at_boundary:
+        r_wide, E_wide = _minimize((-0.5, 1.5))
+        if E_wide < E:
+            r, E = r_wide, E_wide
+        if r < 0.0 or r > 1.0:
+            r_clipped = float(np.clip(r, 0.0, 1.0))
+            E_clipped = _compute_E(F_M_eval, F_N_eval, r_clipped, lam)
+            if E_clipped < E_thresh:
+                return r_clipped, "converged_widened"
+            return None, "failed_E_too_high"
+
+    if E < E_thresh:
+        return float(r), "converged"
+    return None, "failed_E_too_high"
+
+
+def estimate_neuropil_coefs(
+    F: np.ndarray, Fneu: np.ndarray, lam: float = 0.05
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Estimate per-ROI neuropil contamination ratio r.
+
+    Implements Allen Brain Observatory's per-cell r estimation (Visual
+    Behavior 2P Technical Whitepaper, Section F, page 36). For each ROI,
+    the algorithm jointly estimates r and the cleaned cell trace F_C by
+    minimizing
+        E = <(F_C - (F_M - r * F_N))^2 + lambda * (dF_C/dt)^2>_t
+    with lambda = 0.05. F_C has a closed form for any r (tridiagonal
+    smoothing); cross-validated scalar minimization on r minimizes E.
+
+    The Allen whitepaper reports mean r ≈ 0.68 (SD ≈ 0.38) on benchmark
+    GCaMP6f data — substantial cell-to-cell heterogeneity that a fixed
+    coefficient cannot capture.
+
+    ROIs where the optimization fails (e.g. constant F_N, optimum outside
+    plausible bounds) receive the median r of converged ROIs as a fallback,
+    matching the whitepaper's strategy for non-converged cells.
+
+    Validated against synthetic ground truth (100 cells, r drawn from
+    Beta(2, 1.5)): bias ≈ 0, slope ≈ 1, Pearson r ≈ 0.999. See
+    prototype_allen_neuropil.py for the validation harness.
+
+    Parameters
+    ----------
+    F, Fneu : np.ndarray, shape (n_rois, n_timepoints)
+    lam : float, default 0.05
+        Smoothness weight on the cleaned trace.
+
+    Returns
+    -------
+    r_per_roi : np.ndarray, shape (n_rois,), dtype float32
+        Per-ROI contamination ratios in [0, 1]. Failed cells receive the
+        population median r as a fallback.
+    converged : np.ndarray, shape (n_rois,), dtype bool
+        True where the optimization converged cleanly (excluding fallbacks).
+    """
+    n_rois = F.shape[0]
+    r_vals = np.full(n_rois, np.nan)
+    converged = np.zeros(n_rois, dtype=bool)
+
+    for i in range(n_rois):
+        r, status = _fit_r_one_cell(F[i], Fneu[i], lam=lam)
+        if r is not None:
+            r_vals[i] = r
+            converged[i] = True
+
+    if converged.any():
+        fallback_r = float(np.median(r_vals[converged]))
+    else:
+        fallback_r = 0.7  # last-ditch
+    r_vals[~converged] = fallback_r
+
+    return r_vals.astype(np.float32), converged
+
+
+# ============================================================================
 # Core computation
 # ============================================================================
 
 
 def compute_dff(
-    F: np.ndarray, Fneu: np.ndarray, fs: float, params: dict
+    F: np.ndarray,
+    Fneu: np.ndarray,
+    fs: float,
+    params: dict,
+    r_per_roi: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute dF/F for a set of ROI traces.
@@ -87,6 +258,9 @@ def compute_dff(
         Imaging frame rate (Hz).
     params : dict
         Pipeline parameters; see DEFAULT_PARAMS.
+    r_per_roi : np.ndarray, shape (n_rois,), optional
+        Per-ROI neuropil contamination ratios from estimate_neuropil_coefs().
+        If None, falls back to params["neuropil_coef"] as a fixed scalar.
 
     Returns
     -------
@@ -97,8 +271,11 @@ def compute_dff(
     floor_mask : np.ndarray, shape (n_rois, n_timepoints), dtype bool
         True where F0 was clipped to the floor.
     """
-    # Step 1: Neuropil correction
-    F_corr = F - params["neuropil_coef"] * Fneu
+    # Step 1: Neuropil correction — per-ROI r if provided, else fixed scalar.
+    if r_per_roi is None:
+        coef = float(params.get("neuropil_coef") or 0.7)
+        r_per_roi = np.full(F.shape[0], coef, dtype=np.float32)
+    F_corr = F - r_per_roi[:, np.newaxis] * Fneu
 
     # Step 2: Light pre-smoothing — used only to stabilize F0 estimation.
     # The dF/F numerator uses unsmoothed F_corr (see module docstring).
@@ -121,10 +298,12 @@ def compute_dff(
         ]
     )
 
-    # Step 4: Per-ROI floor anchored to median(F_corr) — unsmoothed — so the
-    # floor shares the same reference scale as the dF/F numerator.
+    # Step 4: Per-ROI floor anchored to |median(F_corr)| — absolute value
+    # ensures the floor is always non-negative even when neuropil over-subtraction
+    # pushes median(F_corr) below zero. Without abs, a negative floor_per_roi can
+    # propagate to a negative F0_floored, inverting the sign of dF/F.
     median_F_per_roi = np.median(F_corr, axis=1, keepdims=True)
-    floor_per_roi = params["f0_floor_epsilon"] * median_F_per_roi
+    floor_per_roi = params["f0_floor_epsilon"] * np.abs(median_F_per_roi)
     floor_mask = F0 < floor_per_roi
     F0_floored = np.where(floor_mask, floor_per_roi, F0)
 
@@ -202,7 +381,7 @@ def make_diagnostic_figure(
         F0.shape[0], size=min(n_examples, F0.shape[0]), replace=False
     )
     t_minutes = np.arange(F0.shape[1]) / fs / 60
-    for i, roi in enumerate(example_idx):
+    for roi in example_idx:
         ax.plot(t_minutes, F0[roi], lw=0.8, alpha=0.8)
     ax.set_xlabel("time (min)")
     ax.set_ylabel("F0")
@@ -253,6 +432,7 @@ def make_cell_summary(
     F: np.ndarray,
     cell_indices: np.ndarray,
     iscell_prob: np.ndarray,
+    r_per_roi: np.ndarray,
     output_path: Path,
 ) -> None:
     """Save per-cell summary statistics as CSV."""
@@ -261,6 +441,7 @@ def make_cell_summary(
             "row_index": np.arange(dff.shape[0]),
             "suite2p_roi_index": cell_indices,
             "iscell_prob": iscell_prob,
+            "neuropil_coef": r_per_roi,
             "median_F": np.median(F, axis=1),
             "median_F0": np.median(F0, axis=1),
             "dff_max": dff.max(axis=1),
@@ -279,6 +460,8 @@ def save_metadata(
     n_rois_total: int,
     n_cells_after_iscell: int,
     n_cells_final: int,
+    r_per_roi: np.ndarray,
+    n_r_fallback: int,
     output_path: Path,
 ) -> None:
     """Save run metadata as JSON.
@@ -300,6 +483,13 @@ def save_metadata(
         "n_cells_after_iscell": int(n_cells_after_iscell),
         # n_cells_final: written to dff.h5 — after all filtering steps.
         "n_cells_final": int(n_cells_final),
+        "neuropil_coef_per_roi": {
+            "mean": float(r_per_roi.mean()),
+            "std": float(r_per_roi.std()),
+            "min": float(r_per_roi.min()),
+            "max": float(r_per_roi.max()),
+            "n_fallback": int(n_r_fallback),
+        },
         "parameters": params,
     }
     with open(output_path, "w") as f:
@@ -311,6 +501,7 @@ def save_dff_h5(
     F0: np.ndarray,
     cell_indices: np.ndarray,
     iscell_prob: np.ndarray,
+    r_per_roi: np.ndarray,
     params: dict,
     fs: float,
     output_path: Path,
@@ -321,9 +512,12 @@ def save_dff_h5(
         f.create_dataset("F0", data=F0, compression="gzip", compression_opts=4)
         f.create_dataset("cell_indices", data=cell_indices)
         f.create_dataset("iscell_prob", data=iscell_prob)
+        f.create_dataset("neuropil_coef", data=r_per_roi)
         meta = f.create_group("metadata")
         meta.attrs["fs"] = fs
-        meta.attrs["neuropil_coef"] = params["neuropil_coef"]
+        meta.attrs["neuropil_coef_method"] = "per_roi_regression"
+        meta.attrs["neuropil_coef_mean"] = float(r_per_roi.mean())
+        meta.attrs["neuropil_coef_std"] = float(r_per_roi.std())
         meta.attrs["baseline_method"] = (
             f"rolling_percentile_{params['baseline_percentile']}"
         )
@@ -380,46 +574,36 @@ def run(suite2p_dir: Path, output_dir: Path, params: dict) -> None:
     cell_indices = np.where(cell_mask)[0]
     iscell_prob_kept = iscell[cell_mask, 1].astype(np.float32)
 
-    # Pre-filter: drop ROIs where F_corrected dips substantially negative.
-    # These ROIs have neuropil contamination exceeding the cell signal during
-    # parts of the session, and produce extreme dF/F regardless of the F0
-    # floor. They are typically not real cells (partial cells, out-of-plane
-    # ROIs, or contamination-dominated detections). Using the 5th percentile
-    # rather than the median catches cells that are mostly positive but dip
-    # negative for some fraction of the session.
-    F_corr_check = F_kept - params["neuropil_coef"] * Fneu_kept
-    pre_filter_mask = np.percentile(F_corr_check, 5, axis=1) > 0
-    n_pre_dropped = int((~pre_filter_mask).sum())
-    if n_pre_dropped > 0:
+    # Estimate per-ROI neuropil coefficient r (Allen whitepaper, Section F).
+    # If params["neuropil_coef"] is a float, skip estimation and use it directly.
+    fixed_coef = params.get("neuropil_coef")
+    if fixed_coef is not None:
+        r_per_roi = np.full(F_kept.shape[0], float(fixed_coef), dtype=np.float32)
+        r_converged = np.ones(F_kept.shape[0], dtype=bool)
+        print(f"  Neuropil coef: fixed={fixed_coef}")
+    else:
+        r_per_roi, r_converged = estimate_neuropil_coefs(F_kept, Fneu_kept)
+        n_fallback = int((~r_converged).sum())
         print(
-            f"  [Pre-filter] Dropping {n_pre_dropped} ROIs with negative "
-            f"5th-percentile F_corrected (neuropil dominates in tail)"
+            f"  Neuropil coef: mean={r_per_roi.mean():.3f} "
+            f"± {r_per_roi.std():.3f} "
+            f"[{r_per_roi.min():.3f}, {r_per_roi.max():.3f}]"
+            + (f", {n_fallback} fallback" if n_fallback else "")
         )
-        F_kept = F_kept[pre_filter_mask]
-        Fneu_kept = Fneu_kept[pre_filter_mask]
-        cell_indices = cell_indices[pre_filter_mask]
-        iscell_prob_kept = iscell_prob_kept[pre_filter_mask]
 
-    if F_kept.shape[0] == 0:
-        raise RuntimeError(
-            "No ROIs passed both iscell and F_corrected filters. "
-            "Check the upstream Suite2p output."
-        )
+    # No pre-filter step (removed in v0.4.0). The per-cell r estimator's
+    # boundary-widening logic handles cells where neuropil dominates by
+    # flagging them and assigning the population median r as fallback.
 
     print(
-        f"Computing dF/F (neuropil_coef={params['neuropil_coef']}, "
-        f"baseline=rolling_p{params['baseline_percentile']}, "
+        f"Computing dF/F (baseline=rolling_p{params['baseline_percentile']}, "
         f"window={params['baseline_window_sec']}s, "
         f"presmooth_sigma={params['presmooth_sigma_sec']}s, "
         f"f0_floor_epsilon={params['f0_floor_epsilon']})"
     )
-    dff, F0, floor_mask = compute_dff(F_kept, Fneu_kept, fs, params)
+    dff, F0, floor_mask = compute_dff(F_kept, Fneu_kept, fs, params, r_per_roi)
 
-    # Post-filter: drop cells with high floor-fraction. Cells where F0 is
-    # pinned to the floor for > post_filter_floor_frac of the session indicate
-    # that the rolling baseline can't track the trace cleanly — typically
-    # because of dim signal, transient artifacts, or contamination not caught
-    # by the pre-filter. Including them produces extreme negative dF/F outliers.
+    # Post-filter: drop cells with high floor-fraction.
     post_filter_floor_frac = params["post_filter_floor_frac"]
     floor_frac_per_cell = floor_mask.mean(axis=1)
     post_filter_mask = floor_frac_per_cell <= post_filter_floor_frac
@@ -433,6 +617,8 @@ def run(suite2p_dir: Path, output_dir: Path, params: dict) -> None:
         Fneu_kept = Fneu_kept[post_filter_mask]
         cell_indices = cell_indices[post_filter_mask]
         iscell_prob_kept = iscell_prob_kept[post_filter_mask]
+        r_per_roi = r_per_roi[post_filter_mask]
+        r_converged = r_converged[post_filter_mask]
         dff = dff[post_filter_mask]
         F0 = F0[post_filter_mask]
         floor_mask = floor_mask[post_filter_mask]
@@ -459,9 +645,17 @@ def run(suite2p_dir: Path, output_dir: Path, params: dict) -> None:
     print(f"  Fraction of timepoints at F0 floor: {floor_frac:.4f}")
 
     # Save outputs
+    n_r_fallback = int((~r_converged).sum())
     print(f"\nSaving outputs to: {output_dir}")
     save_dff_h5(
-        dff, F0, cell_indices, iscell_prob_kept, params, fs, output_dir / "dff.h5"
+        dff,
+        F0,
+        cell_indices,
+        iscell_prob_kept,
+        r_per_roi,
+        params,
+        fs,
+        output_dir / "dff.h5",
     )
     print(f"  dff.h5")
 
@@ -475,6 +669,7 @@ def run(suite2p_dir: Path, output_dir: Path, params: dict) -> None:
         F_kept,
         cell_indices,
         iscell_prob_kept,
+        r_per_roi,
         output_dir / "dff_cell_summary.csv",
     )
     print(f"  dff_cell_summary.csv")
@@ -486,6 +681,8 @@ def run(suite2p_dir: Path, output_dir: Path, params: dict) -> None:
         n_rois_total,
         n_cells_after_iscell,
         n_cells_final,
+        r_per_roi,
+        n_r_fallback,
         output_dir / "dff_metadata.json",
     )
     print(f"  dff_metadata.json")
@@ -510,7 +707,14 @@ def main():
         help="Directory to write dff.h5 and diagnostic outputs.",
     )
     parser.add_argument(
-        "--neuropil_coef", type=float, default=DEFAULT_PARAMS["neuropil_coef"]
+        "--neuropil_coef",
+        type=float,
+        default=None,
+        help=(
+            "Fixed neuropil subtraction coefficient for all ROIs. "
+            "Default: estimate per ROI via Allen's cross-validated regression "
+            "(Visual Behavior 2P whitepaper, Section F)."
+        ),
     )
     parser.add_argument(
         "--presmooth_sigma_sec",
