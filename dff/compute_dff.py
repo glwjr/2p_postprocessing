@@ -199,8 +199,7 @@ def estimate_neuropil_coefs(
     matching the whitepaper's strategy for non-converged cells.
 
     Validated against synthetic ground truth (100 cells, r drawn from
-    Beta(2, 1.5)): bias ≈ 0, slope ≈ 1, Pearson r ≈ 0.999. See
-    prototype_allen_neuropil.py for the validation harness.
+    Beta(2, 1.5)): bias ≈ 0, slope ≈ 1, Pearson r ≈ 0.999.
 
     Parameters
     ----------
