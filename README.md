@@ -8,16 +8,17 @@ This repo provides standardized post-processing steps that run after Suite2p (ce
 
 ## Modules
 
-| Module         | Status  | Description                                                                                  |
-| -------------- | ------- | -------------------------------------------------------------------------------------------- |
-| [`dff/`](dff/) | Draft   | Standardized dF/F computation from Suite2p F/Fneu traces                                     |
-| `similarity/`  | Planned | Cross-session pairwise similarity analysis on dF/F traces (consumes ROICaT UCID assignments) |
+| Module                       | Status  | Description                                                                                  |
+| ---------------------------- | ------- | -------------------------------------------------------------------------------------------- |
+| [`dff/`](dff/)               | Draft   | Standardized dF/F computation from Suite2p F/Fneu traces                                     |
+| [`tracking/`](tracking/)     | Draft   | Cross-session ROI tracking via ROICaT (FOV alignment + ROInet embeddings + clustering)       |
+| `similarity/`                | Planned | Cross-session pairwise similarity analysis on dF/F traces (consumes ROICaT UCID assignments) |
 
 ## Notebooks
 
-| Notebook                                                                 | Description                                                            |
-| ------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
-| [`notebooks/tracking_notebook.ipynb`](notebooks/tracking_notebook.ipynb) | Interactive ROICaT tracking pipeline for matching ROIs across sessions |
+| Notebook                                                                                       | Description                                                                |
+| ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| [`tracking/notebooks/interactive_tracking.ipynb`](tracking/notebooks/interactive_tracking.ipynb) | Interactive ROICaT tracking pipeline for matching ROIs across sessions     |
 
 ## Pipeline context
 
@@ -28,29 +29,29 @@ Raw 2P imaging data
    Suite2p  (2p_imaging)
         │  F.npy, Fneu.npy, iscell.npy, ops.npy per session
         │
-        ├───────────────────────────────────────┐
-        ▼                                       ▼
-   dff/compute_dff.py                  notebooks/tracking_notebook.ipynb
-   ─────────────────                  ──────────────────────────────────
+        ├───────────────────────────────────────────────────┐
+        ▼                                                   ▼
+   dff/compute_dff.py                  tracking/notebooks/interactive_tracking.ipynb
+   ─────────────────                  ──────────────────────────────────────────────
    neuropil correction                geometric + non-rigid FOV alignment
    rolling-percentile F₀              ROInet + SWT feature embedding
    dF/F with diagnostics              HDBSCAN / Hungarian clustering
-        │                                       │
-        │  dff.h5                               │  UCID assignments
-        │  dff_cell_summary.csv                 │  (cross-session ROI labels)
-        │  dff_metadata.json                    │
-        │  dff_diagnostics.png                  │
-        │                                       │
-        └───────────────┬───────────────────────┘
-                        ▼
-             similarity/  (planned)
-             ────────────────────────────────────
-             cross-session pairwise similarity
-             on dF/F traces, keyed by UCID
-                        │
-                        ▼
-             Downstream science
-             (plasticity, representational drift, …)
+        │                                                   │
+        │  dff.h5                                           │  UCID assignments
+        │  dff_cell_summary.csv                             │  (cross-session ROI labels)
+        │  dff_metadata.json                                │
+        │  dff_diagnostics.png                              │
+        │                                                   │
+        └─────────────────────────┬─────────────────────────┘
+                                  ▼
+                       similarity/  (planned)
+                       ────────────────────────────────────
+                       cross-session pairwise similarity
+                       on dF/F traces, keyed by UCID
+                                  │
+                                  ▼
+                       Downstream science
+                       (plasticity, representational drift, …)
 ```
 
 ## Setup
@@ -72,6 +73,6 @@ This creates an environment with the scientific Python stack (numpy, scipy, h5py
 
 ## Attribution
 
-- The notebook [notebooks/tracking_notebook.ipynb](notebooks/tracking_notebook.ipynb) is adapted from the ROICaT project (RichieHakim/ROICaT) by Rich Hakim. ROICaT is licensed under the GNU General Public License v3.0 (GPL-3.0). Because content from ROICaT is included here, redistribution or publication of this notebook (or a larger work that includes it) must comply with GPL-3.0: preserve copyright and license notices, make source available, and apply the same license to derivative works. See https://www.gnu.org/licenses/gpl-3.0.en.html for details.
+- The notebook [tracking/notebooks/interactive_tracking.ipynb](tracking/notebooks/interactive_tracking.ipynb) is adapted from the ROICaT project (RichieHakim/ROICaT) by Rich Hakim. ROICaT is licensed under the GNU General Public License v3.0 (GPL-3.0). Because content from ROICaT is included here, redistribution or publication of this notebook (or a larger work that includes it) must comply with GPL-3.0: preserve copyright and license notices, make source available, and apply the same license to derivative works. See https://www.gnu.org/licenses/gpl-3.0.en.html for details.
 
 If you plan to redistribute or publish this repository or derivative works, ensure you understand and follow the GPL-3.0 obligations, or contact the original author for alternate licensing if needed.
