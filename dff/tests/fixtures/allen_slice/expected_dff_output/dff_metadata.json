@@ -1,0 +1,26 @@
+{
+  "pipeline_version": "0.4.1",
+  "timestamp_utc": "2026-05-10T00:29:41Z",
+  "fs": 30.1386377336634,
+  "n_timepoints": 9041,
+  "session_length_sec": 299.9803799991146,
+  "n_rois_total": 30,
+  "n_cells_after_iscell": 30,
+  "n_cells_final": 30,
+  "neuropil_coef_per_roi": {
+    "mean": 0.371694415807724,
+    "std": 0.22579163312911987,
+    "min": 0.1301799714565277,
+    "max": 1.0,
+    "n_fallback": 0
+  },
+  "parameters": {
+    "neuropil_coef": null,
+    "presmooth_sigma_sec": 1.0,
+    "baseline_percentile": 8,
+    "baseline_window_sec": 30.0,
+    "f0_floor_epsilon": 0.1,
+    "iscell_threshold": 0.3,
+    "post_filter_floor_frac": 0.05
+  }
+}
