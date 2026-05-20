@@ -104,3 +104,6 @@ dff_metadata.json
 # Logs
 *.log
 logs/
+
+!dff/tests/fixtures/allen_slice/
+!dff/tests/fixtures/allen_slice/**
