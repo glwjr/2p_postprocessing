@@ -2,20 +2,16 @@ name: 2p_postprocessing
 channels:
   - conda-forge
 dependencies:
-  # Python — ROICaT requires 3.11 or 3.12 (3.13 not yet supported)
   - python=3.12
-
-  # Core scientific stack (used by compute_dff.py and downstream modules)
   - numpy>=1.24
   - scipy>=1.10
   - h5py>=3.8
   - matplotlib>=3.7
   - pandas>=2.0
-
-  # Dev dependencies
   - pytest>=7.0
-
-  # pip is required to install ROICaT (not available via conda-forge)
+  - jupyterlab
+  - ipykernel
+  - onnx
   - pip
   - pip:
       - roicat[all]
