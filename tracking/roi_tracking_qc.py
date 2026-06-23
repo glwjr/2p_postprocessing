@@ -20,8 +20,7 @@ Visual conventions
   Gaussian smoothing (σ = 1.5 px) is applied before contouring to merge the
   small disconnected fragments that arise from sparse suite2p masks after
   nonrigid warping.
-- "n/d" marker: dashed circle at the consensus centroid when a session has no
-  detection for this UCID.
+- Sessions with no detection for this UCID are left blank (no marker).
 - Crop box: a thin dashed yellow rectangle drawn on full-FOV rows (raw and
   aligned) to show where the zoomed row sits spatially.
 
@@ -97,7 +96,18 @@ def _session_roi_index(labels_bySession, session, ucid):
     return int(hits[0]) if len(hits) else None
 
 
-def _draw(ax, bg, fp, centroid, crop_hw, color, present, label, zoom_box_hw=None):
+def _draw(
+    ax,
+    bg,
+    fp,
+    centroid,
+    crop_hw,
+    color,
+    present,
+    label,
+    zoom_box_hw=None,
+    zoom_box_centroids=None,
+):
     """Render one panel of the QC figure.
 
     Parameters
@@ -111,8 +121,12 @@ def _draw(ax, bg, fp, centroid, crop_hw, color, present, label, zoom_box_hw=None
     present : bool — whether this session detected the ROI
     label : str | None — panel title (shown above the axes)
     zoom_box_hw : int | None
-        If set, draw a thin dashed yellow rectangle of ±zoom_box_hw around
-        centroid to indicate where the zoomed row sits.
+        If set, draw thin dashed yellow rectangles of ±zoom_box_hw to indicate
+        where the zoomed row sits.
+    zoom_box_centroids : list of (row, col) or None
+        Centres for each yellow box.  When None, a single box is drawn at
+        `centroid`.  Pass a per-session list to draw one box per session
+        (used on the superimposed raw-FOV panel).
     """
     fH, fW = bg.shape
     ax.imshow(bg, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
@@ -126,7 +140,6 @@ def _draw(ax, bg, fp, centroid, crop_hw, color, present, label, zoom_box_hw=None
         if fp_s.max() > 0:
             ax.contour(fp_s, levels=[fp_s.max() * 0.5], colors=[color], linewidths=1.1)
     else:
-        ax.plot(c, r, marker="o", mfc="none", mec=color, mew=1.2, ms=14, ls="--")
         ax.text(
             0.5,
             0.04,
@@ -145,22 +158,24 @@ def _draw(ax, bg, fp, centroid, crop_hw, color, present, label, zoom_box_hw=None
         ax.set_ylim(r1, r0)  # inverted y for image coordinates
 
     if zoom_box_hw is not None:
-        r0b = max(0, r - zoom_box_hw)
-        r1b = min(fH, r + zoom_box_hw)
-        c0b = max(0, c - zoom_box_hw)
-        c1b = min(fW, c + zoom_box_hw)
-        ax.add_patch(
-            Rectangle(
-                (c0b, r0b),
-                c1b - c0b,
-                r1b - r0b,
-                linewidth=0.8,
-                edgecolor="yellow",
-                facecolor="none",
-                linestyle="--",
-                zorder=5,
+        centers = zoom_box_centroids if zoom_box_centroids is not None else [(r, c)]
+        for rb, cb in centers:
+            r0b = max(0, rb - zoom_box_hw)
+            r1b = min(fH, rb + zoom_box_hw)
+            c0b = max(0, cb - zoom_box_hw)
+            c1b = min(fW, cb + zoom_box_hw)
+            ax.add_patch(
+                Rectangle(
+                    (c0b, r0b),
+                    c1b - c0b,
+                    r1b - r0b,
+                    linewidth=0.8,
+                    edgecolor="yellow",
+                    facecolor="none",
+                    linestyle="--",
+                    zorder=5,
+                )
             )
-        )
 
     # pixel-coordinate tick labels (sparse, small)
     ax.xaxis.set_major_locator(MaxNLocator(4, integer=True))
@@ -184,6 +199,7 @@ def build_ucid_figure(
     H,
     W,
     fovs_raw=None,
+    rois_raw=None,
     mouse_name=None,
     crop_halfwidth=40,
     superimpose="mean",
@@ -201,6 +217,10 @@ def build_ucid_figure(
     fovs_raw : list of (H, W) arrays or None
         Unregistered FOV images (e.g. data.FOV_images).  When supplied, a
         third row is added showing the raw FOVs with a crop-box overlay.
+    rois_raw : same structure as rois_aligned or None
+        Pre-alignment ROI footprints.  When supplied alongside fovs_raw, the
+        raw-FOV row uses these footprints (and their centroid) so that the ROI
+        contour and yellow crop-box reflect the true pre-alignment position.
     mouse_name : str or None
         E.g. "SA11_LG".  Prepended to the figure suptitle.
     session_names : list of str or None
@@ -240,6 +260,25 @@ def build_ucid_figure(
     fp_con = np.sum(present_fps, 0) if present_fps else np.zeros((H, W))
     centroid = _weighted_centroid(fp_con)
 
+    # Pre-alignment footprints and per-session centroids for the raw FOV row
+    fps_raw: list = []
+    fp_con_raw: np.ndarray = fp_con
+    centroid_raw = centroid
+    centroids_raw_per_session: list = []  # one (r,c) per session, or None if absent
+    if use_raw and rois_raw is not None:
+        fps_raw = [_footprint_image(rois_raw, s, idxs[s], H, W) for s in range(n)]
+        present_fps_raw = [f for f, p in zip(fps_raw, present) if p and f is not None]
+        fp_con_raw = np.sum(present_fps_raw, 0) if present_fps_raw else np.zeros((H, W))
+        centroid_raw = _weighted_centroid(fp_con_raw)
+        centroids_raw_per_session = [
+            (
+                _weighted_centroid(fps_raw[s])
+                if (present[s] and fps_raw[s] is not None)
+                else None
+            )
+            for s in range(n)
+        ]
+
     # ── figure layout ────────────────────────────────────────────────────────
     fig, axes = plt.subplots(
         n_rows,
@@ -252,16 +291,21 @@ def build_ucid_figure(
 
     # ── column 0: superimposed ───────────────────────────────────────────────
     if use_raw:
+        # Superimposed raw: one yellow box per session at each session's raw centroid
+        valid_raw_centroids = [
+            c for c in centroids_raw_per_session if c is not None
+        ] or None
         _draw(
             axes[0, 0],
             super_raw,
-            fp_con,
-            centroid,
+            fp_con_raw,
+            centroid_raw,
             None,
             roi_color,
-            fp_con.max() > 0,
+            fp_con_raw.max() > 0,
             "Superimposed",
             zoom_box_hw=crop_halfwidth,
+            zoom_box_centroids=valid_raw_centroids,
         )
 
     _draw(
@@ -291,16 +335,27 @@ def build_ucid_figure(
     for s in range(n):
         col_title = session_names[s]
         if use_raw:
+            fp_raw_s = fps_raw[s] if fps_raw else fps[s]
+            # Use this session's own raw centroid so the box tracks the pre-alignment position;
+            # fall back to the consensus raw centroid for absent sessions (n/d marker placement).
+            cen_raw_s = (
+                centroids_raw_per_session[s]
+                if (
+                    centroids_raw_per_session
+                    and centroids_raw_per_session[s] is not None
+                )
+                else centroid_raw
+            )
             _draw(
                 axes[0, s + 1],
                 bg_raw[s],
-                fps[s],
-                centroid,
+                fp_raw_s,
+                cen_raw_s,
                 None,
                 roi_color,
                 present[s],
                 col_title,
-                zoom_box_hw=crop_halfwidth,
+                zoom_box_hw=crop_halfwidth if present[s] else None,
             )
         _draw(
             axes[r_aligned, s + 1],
@@ -311,7 +366,7 @@ def build_ucid_figure(
             roi_color,
             present[s],
             col_title if not use_raw else None,
-            zoom_box_hw=crop_halfwidth,
+            zoom_box_hw=crop_halfwidth if present[s] else None,
         )
         _draw(
             axes[r_zoom, s + 1],
