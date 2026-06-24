@@ -40,7 +40,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import MaxNLocator
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, uniform_filter, binary_dilation
 
 try:
     import scipy.sparse as sp
@@ -90,6 +90,61 @@ def _norm(img, p=(1, 99)):
     return np.clip((img - lo) / (hi - lo), 0, 1)
 
 
+def _aligned_mask_in_raw_coords(fov_aln, fov_raw, remapping_idx=None, window=7):
+    """Return a (H_raw, W_raw) bool mask showing the aligned tissue region in
+    raw-image coordinates.
+
+    Strategy:
+      1. Detect tissue in the aligned image via local variance (robust to the
+         uniform gray fill cv2.remap inserts for out-of-bounds pixels).
+      2. For every tissue pixel (y, x) in the aligned frame, use the aligner's
+         remapping index — remapping_idx[y, x] = [src_col, src_row] — to look
+         up the exact corresponding raw pixel and mark it True on the canvas.
+      3. A single dilation pass fills the ~1-pixel gaps that arise from rounding
+         the floating-point source coordinates to integer pixel positions.
+
+    Parameters
+    ----------
+    fov_aln : (H, W) array  — one session's aligned FOV image
+    fov_raw : (H, W) array  — corresponding raw (unregistered) FOV image
+    remapping_idx : (H, W, 2) float array
+        aligner.remappingIdx_nonrigid[session]: for output pixel (y, x),
+        raw source coordinates are (remapping_idx[y, x, 0],  ← col / x
+                                    remapping_idx[y, x, 1])  ← row / y
+    """
+    aln = np.asarray(fov_aln, dtype=float)
+    H_aln, W_aln = aln.shape[:2]
+    H_raw, W_raw = np.asarray(fov_raw).shape[:2]
+
+    lm = uniform_filter(aln, size=window)
+    var_aln = np.clip(uniform_filter(aln**2, size=window) - lm**2, 0, None)
+    vmax = var_aln.max()
+    mask_aln = (
+        var_aln > vmax * 0.01 if vmax > 0 else np.ones((H_aln, W_aln), dtype=bool)
+    )
+
+    canvas = np.zeros((H_raw, W_raw), dtype=bool)
+
+    if remapping_idx is None:
+        # Fallback: place the aligned mask centred in the raw canvas.
+        r0 = (H_raw - H_aln) // 2
+        c0 = (W_raw - W_aln) // 2
+        canvas[r0 : r0 + H_aln, c0 : c0 + W_aln] = mask_aln
+        return canvas
+
+    remap = np.asarray(remapping_idx, dtype=float)
+    tissue_yx = np.argwhere(mask_aln)  # (N, 2): [row, col] in aligned
+    if len(tissue_yx) == 0:
+        return canvas
+
+    raw_col = np.round(remap[tissue_yx[:, 0], tissue_yx[:, 1], 0]).astype(int)
+    raw_row = np.round(remap[tissue_yx[:, 0], tissue_yx[:, 1], 1]).astype(int)
+    valid = (raw_col >= 0) & (raw_col < W_raw) & (raw_row >= 0) & (raw_row < H_raw)
+    canvas[raw_row[valid], raw_col[valid]] = True
+
+    return binary_dilation(canvas, iterations=1)
+
+
 def _session_roi_index(labels_bySession, session, ucid):
     """Index of the ROI belonging to ucid in session, or None if absent."""
     hits = np.where(np.asarray(labels_bySession[session]) == ucid)[0]
@@ -107,6 +162,7 @@ def _draw(
     label,
     zoom_box_hw=None,
     zoom_box_centroids=None,
+    aligned_mask=None,
 ):
     """Render one panel of the QC figure.
 
@@ -127,6 +183,10 @@ def _draw(
         Centres for each yellow box.  When None, a single box is drawn at
         `centroid`.  Pass a per-session list to draw one box per session
         (used on the superimposed raw-FOV panel).
+    aligned_mask : (H_raw, W_raw) bool array or None
+        When supplied, draw a cyan contour showing the valid tissue boundary of
+        the raw FOV (True = tissue, False = uniform fill / background).
+        Produced by _aligned_mask_in_raw_coords.
     """
     fH, fW = bg.shape
     ax.imshow(bg, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
@@ -149,6 +209,11 @@ def _draw(
             color=color,
             fontsize=8,
             weight="bold",
+        )
+
+    if aligned_mask is not None and aligned_mask.any() and not aligned_mask.all():
+        ax.contour(
+            aligned_mask.astype(float), levels=[0.5], colors=["cyan"], linewidths=0.9
         )
 
     if crop_hw is not None:
@@ -200,6 +265,7 @@ def build_ucid_figure(
     W,
     fovs_raw=None,
     rois_raw=None,
+    remapping_idxs=None,
     mouse_name=None,
     crop_halfwidth=40,
     superimpose="mean",
@@ -240,7 +306,7 @@ def build_ucid_figure(
     # ── normalise backgrounds ────────────────────────────────────────────────
     bg_aln = [_norm(fovs_aligned[s]) for s in range(n)]
     stk_aln = np.stack(bg_aln, 0)
-    super_aln = stk_aln.max(0) if superimpose == "max" else stk_aln.mean(0)
+    super_aln = _norm(stk_aln.max(0) if superimpose == "max" else stk_aln.mean(0))
 
     # initialised here so they are always bound (filled below when use_raw)
     bg_raw: list[np.ndarray] = []
@@ -249,7 +315,7 @@ def build_ucid_figure(
         assert fovs_raw is not None  # guaranteed by use_raw; helps type checker
         bg_raw = [_norm(fovs_raw[s]) for s in range(n)]
         stk_raw = np.stack(bg_raw, 0)
-        super_raw = stk_raw.max(0) if superimpose == "max" else stk_raw.mean(0)
+        super_raw = _norm(stk_raw.max(0) if superimpose == "max" else stk_raw.mean(0))
 
     # ── per-session footprints + consensus ──────────────────────────────────
     idxs = [_session_roi_index(labels_bySession, s, ucid) for s in range(n)]
@@ -259,6 +325,19 @@ def build_ucid_figure(
     present_fps = [f for f, p in zip(fps, present) if p and f is not None]
     fp_con = np.sum(present_fps, 0) if present_fps else np.zeros((H, W))
     centroid = _weighted_centroid(fp_con)
+
+    # Per-session tissue masks placed in raw-image coordinates for the cyan outline
+    aligned_masks: list[np.ndarray] = []
+    if use_raw:
+        assert fovs_raw is not None
+        aligned_masks = [
+            _aligned_mask_in_raw_coords(
+                fovs_aligned[s],
+                fovs_raw[s],
+                remapping_idx=remapping_idxs[s] if remapping_idxs is not None else None,
+            )
+            for s in range(n)
+        ]
 
     # Pre-alignment footprints and per-session centroids for the raw FOV row
     fps_raw: list = []
@@ -356,6 +435,7 @@ def build_ucid_figure(
                 present[s],
                 col_title,
                 zoom_box_hw=crop_halfwidth if present[s] else None,
+                aligned_mask=aligned_masks[s],
             )
         _draw(
             axes[r_aligned, s + 1],
